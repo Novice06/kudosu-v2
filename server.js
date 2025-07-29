@@ -385,10 +385,10 @@ async function startSudokuBot() {
             }
             
             // Pause obligatoire de 5 secondes entre chaque sudoku
-            if (isProcessing) {
+            /*if (isProcessing) {
                 console.log(`⏳ Pause de ${PAUSE_BETWEEN_SUDOKUS/1000}s avant le prochain sudoku...`);
                 await sleep(PAUSE_BETWEEN_SUDOKUS);
-            }
+            }*/
             
         } catch (error) {
             console.error(`❌ Erreur dans la boucle principale: ${error.message}`);
