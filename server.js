@@ -6,21 +6,19 @@ app.use(express.json());
 
 // Configuration
 const BASE_URL = "https://sudoku.lumitelburundi.com:8083";
-const PAUSE_BETWEEN_SUDOKUS = 5000; // 5 secondes exactement
 
-// Variables d'état
-let isProcessing = false;
-let waitingForToken = false;
+// Variables d'état - TOUTES DYNAMIQUES
 let authToken = '';
-let solvedCount = 0;
-let currentRound = 1;
-let stats = {
-    totalSolved: 0,
-    errors: 0,
-    startTime: null
+let mainBotUrl = '';
+let isInitialized = false;
+let processingStats = {
+    totalProcessed: 0,
+    totalSuccess: 0,
+    totalErrors: 0,
+    lastProcessingTime: 0
 };
 
-// Headers de base (seront complétés avec le token)
+// Headers de base
 const getHeaders = () => ({
     'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:137.0) Gecko/20100101 Firefox/137.0',
     'Accept': 'application/json, text/plain, */*',
@@ -38,253 +36,221 @@ const getHeaders = () => ({
 // Routes API
 app.get("/", (req, res) => {
     res.json({
-        message: "🤖 Dynamic Sudoku Bot API",
-        version: "2.0",
-        status: isProcessing ? "RUNNING" : waitingForToken ? "WAITING_FOR_TOKEN" : "READY",
+        message: "🤖 Worker Sudoku Bot",
+        version: "3.0",
+        status: isInitialized ? "READY" : "WAITING_INITIALIZATION",
+        configuration: {
+            mainBot: mainBotUrl || "Not configured",
+            hasToken: !!authToken,
+            initialized: isInitialized
+        },
+        stats: processingStats,
         endpoints: {
-            status: "GET /status - Statut détaillé du bot",
-            start: "POST /start-bot - Démarre le processus (nécessite un token)",
-            stop: "POST /stop-bot - Arrête le processus",
-            token: "POST /submit-token - Fournit le token d'authentification",
-            stats: "GET /stats - Statistiques de résolution"
+            initialize: "POST /initialize - Initialise le worker (token + mainBotUrl requis)",
+            solveBatch: "POST /solve-batch - Traite un lot de cellules",
+            stop: "POST /stop - Arrête le worker",
+            status: "GET /status - Statut complet",
+            ping: "GET /ping - Test de vie"
         }
     });
 });
 
 app.get("/status", (req, res) => {
     res.json({
-        isProcessing,
-        waitingForToken,
+        isInitialized,
         hasToken: !!authToken,
-        currentRound,
-        solvedCount,
-        stats: {
-            ...stats,
-            uptime: stats.startTime ? Date.now() - stats.startTime : 0
-        }
+        mainBot: mainBotUrl || "Not configured",
+        stats: processingStats,
+        message: isInitialized ? "Worker opérationnel" : "En attente d'initialisation par le bot principal"
     });
 });
 
-app.get("/stats", (req, res) => {
-    const uptime = stats.startTime ? Date.now() - stats.startTime : 0;
-    const avgTimePerSudoku = stats.totalSolved > 0 ? uptime / stats.totalSolved : 0;
+// Initialisation du worker - CONFIGURATION 100% DYNAMIQUE
+app.post("/initialize", (req, res) => {
+    const { token, mainBotUrl: providedMainUrl } = req.body;
     
-    res.json({
-        totalSolved: stats.totalSolved,
-        errors: stats.errors,
-        currentRound,
-        uptime: Math.floor(uptime / 1000), // en secondes
-        averageTimePerSudoku: Math.floor(avgTimePerSudoku / 1000), // en secondes
-        successRate: stats.totalSolved + stats.errors > 0 ? 
-            ((stats.totalSolved / (stats.totalSolved + stats.errors)) * 100).toFixed(2) + '%' : '0%'
-    });
-});
-
-app.post("/start-bot", (req, res) => {
-    const { token } = req.body;
-    
-    if (isProcessing) {
-        return res.status(400).json({
-            success: false,
-            error: "Le bot est déjà en cours d'exécution"
-        });
-    }
-
-    if (token) {
-        authToken = token;
-        waitingForToken = false;
-    } else if (!authToken) {
-        waitingForToken = true;
-        return res.json({
-            success: true,
-            message: "Bot en attente du token d'authentification",
-            waitingForToken: true
-        });
-    }
-
-    try {
-        isProcessing = true;
-        stats.startTime = Date.now();
-        solvedCount = 0;
-        currentRound = 1;
-        
-        console.log("🚀 Démarrage du bot de résolution Sudoku...");
-        
-        // Lancer le processus de résolution
-        startSudokuBot().catch(error => {
-            console.error("❌ Erreur dans le processus:", error);
-            isProcessing = false;
-            stats.errors++;
-        });
-
-        res.json({
-            success: true,
-            message: "Bot démarré avec succès!",
-            token: token ? "✅ Fourni" : "✅ Déjà configuré"
-        });
-    } catch (error) {
-        isProcessing = false;
-        stats.errors++;
-        res.status(500).json({
-            success: false,
-            error: error.message
-        });
-    }
-});
-
-app.post("/stop-bot", (req, res) => {
-    if (!isProcessing) {
-        return res.status(400).json({
-            success: false,
-            error: "Aucun processus en cours"
-        });
-    }
-
-    isProcessing = false;
-    console.log("🛑 Arrêt du bot demandé par l'utilisateur");
-    
-    res.json({
-        success: true,
-        message: "Bot arrêté",
-        finalStats: {
-            totalSolved: stats.totalSolved,
-            errors: stats.errors,
-            uptime: Math.floor((Date.now() - stats.startTime) / 1000)
-        }
-    });
-});
-
-app.post("/submit-token", (req, res) => {
-    const { token } = req.body;
-    
+    // Validation stricte
     if (!token) {
         return res.status(400).json({
             success: false,
-            error: "Token requis"
+            error: "Token d'authentification requis"
         });
     }
-
-    authToken = token;
-    waitingForToken = false;
     
-    console.log("🔑 Token d'authentification reçu");
+    if (!providedMainUrl) {
+        return res.status(400).json({
+            success: false,
+            error: "URL du bot principal requise (mainBotUrl)"
+        });
+    }
+    
+    // Validation format URL
+    try {
+        new URL(providedMainUrl);
+    } catch (error) {
+        return res.status(400).json({
+            success: false,
+            error: "URL du bot principal invalide"
+        });
+    }
+    
+    // Configuration dynamique
+    authToken = token;
+    mainBotUrl = providedMainUrl;
+    isInitialized = true;
+    
+    // Reset des stats
+    processingStats = {
+        totalProcessed: 0,
+        totalSuccess: 0,
+        totalErrors: 0,
+        lastProcessingTime: 0
+    };
+    
+    console.log("🔧 Worker initialisé dynamiquement:");
+    console.log(`   🔑 Token: ${token.substring(0, 10)}...`);
+    console.log(`   🔗 Bot principal: ${mainBotUrl}`);
     
     res.json({
         success: true,
-        message: "Token configuré avec succès"
+        message: "Worker initialisé avec succès",
+        configuration: {
+            mainBot: mainBotUrl,
+            tokenConfigured: true,
+            workerReady: true
+        }
     });
 });
 
-// Fonctions utilitaires
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-// Algorithme de résolution Sudoku (identique à votre version)
-function isSafe(board, row, col, num) {
-    for (let d = 0; d < board.length; d++) {
-        if (board[row][d] === num) {
-            return false;
-        }
-    }
-
-    for (let r = 0; r < board.length; r++) {
-        if (board[r][col] === num) {
-            return false;
-        }
-    }
-
-    const sqrt = Math.floor(Math.sqrt(board.length));
-    const boxRowStart = row - row % sqrt;
-    const boxColStart = col - col % sqrt;
-
-    for (let r = boxRowStart; r < boxRowStart + sqrt; r++) {
-        for (let d = boxColStart; d < boxColStart + sqrt; d++) {
-            if (board[r][d] === num) {
-                return false;
-            }
-        }
-    }
-
-    return true;
-}
-
-function solveSudoku(board) {
-    const n = board.length;
-    let row = -1;
-    let col = -1;
-    let isEmpty = true;
+// Traitement d'un lot de cellules - CŒUR DU WORKER
+app.post("/solve-batch", async (req, res) => {
+    const { tasks } = req.body;
     
-    for (let i = 0; i < n; i++) {
-        for (let j = 0; j < n; j++) {
-            if (board[i][j] === 0) {
-                row = i;
-                col = j;
-                isEmpty = false;
-                break;
-            }
-        }
-        if (!isEmpty) {
-            break;
-        }
+    if (!isInitialized) {
+        return res.status(400).json({
+            success: false,
+            error: "Worker non initialisé. Utilisez /initialize d'abord."
+        });
     }
-
-    if (isEmpty) {
-        return true;
+    
+    if (!tasks || !Array.isArray(tasks)) {
+        return res.status(400).json({
+            success: false,
+            error: "Paramètre 'tasks' requis (array de cellules)"
+        });
     }
-
-    for (let num = 1; num <= n; num++) {
-        if (isSafe(board, row, col, num)) {
-            board[row][col] = num;
-            if (solveSudoku(board)) {
-                return true;
-            } else {
-                board[row][col] = 0;
-            }
-        }
+    
+    if (tasks.length === 0) {
+        return res.json({
+            success: true,
+            completed: 0,
+            total: 0,
+            message: "Aucune tâche à traiter"
+        });
     }
-    return false;
-}
-
-function convertTo2D(gridValues) {
-    const board = [];
-    for (let i = 0; i < 9; i++) {
-        board.push(gridValues.slice(i * 9, (i + 1) * 9).map(Number));
-    }
-    return board;
-}
-
-function findEmptyCells(original, solved) {
-    const emptyCells = [];
-    for (let i = 0; i < 9; i++) {
-        for (let j = 0; j < 9; j++) {
-            if (original[i][j] === 0) {
-                emptyCells.push({ row: i, col: j, value: solved[i][j] });
-            }
-        }
-    }
-    return emptyCells;
-}
-
-// Fonctions API
-async function getSudokuGrid() {
+    
+    console.log(`🔄 Worker: traitement de ${tasks.length} cellules en parallèle`);
+    const startTime = Date.now();
+    
+    let completedCount = 0;
+    const results = [];
+    
     try {
-        const response = await axios.post(`${BASE_URL}/turns/start`, {}, {
-            headers: getHeaders()
+        // Traitement MASSIF en parallèle - vitesse maximale
+        const promises = tasks.map(async (task, index) => {
+            // Validation de la tâche
+            if (!task || typeof task.row !== 'number' || typeof task.col !== 'number' || typeof task.value !== 'number') {
+                return {
+                    index,
+                    success: false,
+                    error: "Tâche invalide",
+                    task
+                };
+            }
+            
+            try {
+                const success = await submitAnswer(task.row, task.col, task.value);
+                if (success) {
+                    completedCount++;
+                }
+                return {
+                    index,
+                    success,
+                    row: task.row,
+                    col: task.col,
+                    value: task.value
+                };
+            } catch (error) {
+                console.error(`❌ Worker erreur ${task.row},${task.col}=${task.value}: ${error.message}`);
+                return {
+                    index,
+                    success: false,
+                    row: task.row,
+                    col: task.col,
+                    value: task.value,
+                    error: error.message
+                };
+            }
         });
         
-        if (response.data && response.data.board) {
-            console.log("✅ Nouvelle grille récupérée");
-            return response.data.board;
-        }
+        // Attendre TOUS les résultats
+        const taskResults = await Promise.all(promises);
+        results.push(...taskResults);
         
-        throw new Error("Format de grille invalide");
+        const processingTime = Date.now() - startTime;
+        
+        // Mise à jour des statistiques
+        processingStats.totalProcessed += tasks.length;
+        processingStats.totalSuccess += completedCount;
+        processingStats.totalErrors += (tasks.length - completedCount);
+        processingStats.lastProcessingTime = processingTime;
+        
+        console.log(`✅ Worker terminé: ${completedCount}/${tasks.length} OK en ${processingTime}ms`);
+        console.log(`   📊 Vitesse: ${Math.round((tasks.length / processingTime) * 1000)} cellules/seconde`);
+        
+        res.json({
+            success: true,
+            completed: completedCount,
+            total: tasks.length,
+            processingTime,
+            speed: Math.round((tasks.length / processingTime) * 1000), // cellules/seconde
+            successRate: ((completedCount / tasks.length) * 100).toFixed(1) + '%',
+            results: results
+        });
+        
     } catch (error) {
-        console.error(`❌ Erreur récupération grille: ${error.message}`);
-        throw error;
+        console.error("❌ Erreur critique traitement batch:", error.message);
+        
+        processingStats.totalProcessed += tasks.length;
+        processingStats.totalErrors += tasks.length;
+        
+        res.status(500).json({
+            success: false,
+            error: error.message,
+            completed: completedCount,
+            total: tasks.length,
+            processingTime: Date.now() - startTime
+        });
     }
-}
+});
 
+// Arrêt du worker
+app.post("/stop", (req, res) => {
+    console.log("🛑 Arrêt du worker demandé");
+    
+    // Reset de la configuration
+    isInitialized = false;
+    authToken = '';
+    mainBotUrl = '';
+    
+    res.json({
+        success: true,
+        message: "Worker arrêté et réinitialisé",
+        finalStats: processingStats
+    });
+});
+
+// Fonction de soumission - OPTIMISÉE POUR LA VITESSE
 async function submitAnswer(row, col, value) {
     try {
         const headers = getHeaders();
@@ -293,139 +259,91 @@ async function submitAnswer(row, col, value) {
         
         const response = await axios.post(`${BASE_URL}/turns/submit`, {
             answer: { row, col, value }
-        }, { headers });
+        }, { 
+            headers,
+            timeout: 10000, // 10 secondes max par requête
+            validateStatus: (status) => status < 500 // Accepter même les erreurs 4xx
+        });
         
-        return true;
+        return response.status < 400;
     } catch (error) {
-        console.error(`❌ Erreur soumission (${row},${col})=${value}: ${error.message}`);
+        // Log minimal pour performance
+        if (error.code !== 'ECONNABORTED') { // Pas de log pour les timeouts
+            console.error(`⚠️ ${row},${col}=${value}: ${error.response?.status || error.code}`);
+        }
         throw error;
     }
 }
 
-// Fonction principale de résolution
-async function solveOneSudoku() {
-    const roundStart = Date.now();
-    console.log(`\n🎯 === ROUND ${currentRound} ===`);
-    
-    try {
-        // 1. Récupérer la grille
-        console.log("📥 Récupération de la grille...");
-        const originalGrid = await getSudokuGrid();
-        
-        // 2. Résoudre le sudoku
-        console.log("🧠 Résolution en cours...");
-        const gridCopy = originalGrid.map(row => [...row]);
-        
-        if (!solveSudoku(gridCopy)) {
-            throw new Error("Impossible de résoudre cette grille");
-        }
-        
-        // 3. Identifier les cellules à remplir
-        const emptyCells = findEmptyCells(originalGrid, gridCopy);
-        console.log(`📝 ${emptyCells.length} cellules à remplir`);
-        
-        // 4. Soumettre les réponses (sans délai entre chaque soumission)
-        console.log("📤 Soumission des réponses...");
-        let successCount = 0;
-        
-        for (const cell of emptyCells) {
-            try {
-                await submitAnswer(cell.row, cell.col, cell.value);
-                successCount++;
-            } catch (error) {
-                console.error(`⚠️ Échec soumission ${cell.row},${cell.col}`);
-            }
-        }
-        
-        const roundTime = Date.now() - roundStart;
-        console.log(`✅ Round ${currentRound} terminé: ${successCount}/${emptyCells.length} réponses OK (${roundTime}ms)`);
-        
-        // Incrémenter les compteurs
-        currentRound++;
-        solvedCount++;
-        stats.totalSolved++;
-        
-        return true;
-        
-    } catch (error) {
-        console.error(`❌ Erreur Round ${currentRound}: ${error.message}`);
-        stats.errors++;
-        return false;
-    }
-}
-
-// Processus principal du bot
-async function startSudokuBot() {
-    console.log("🤖 === DÉMARRAGE DU BOT SUDOKU DYNAMIQUE ===");
-    console.log(`⏱️ Pause entre sudokus: ${PAUSE_BETWEEN_SUDOKUS/1000}s`);
-    
-    while (isProcessing) {
-        try {
-            // Vérifier le token
-            if (!authToken) {
-                console.log("⏳ En attente du token d'authentification...");
-                waitingForToken = true;
-                
-                while (!authToken && isProcessing) {
-                    await sleep(1000);
-                }
-                
-                waitingForToken = false;
-                if (!isProcessing) break;
-                console.log("🔑 Token reçu, reprise du processus");
-            }
-            
-            // Résoudre un sudoku
-            const success = await solveOneSudoku();
-            
-            if (!success) {
-                console.log("⚠️ Échec de résolution, pause de 2 secondes");
-                await sleep(2000);
-                continue;
-            }
-            
-            // Pause obligatoire de 5 secondes entre chaque sudoku
-            /*if (isProcessing) {
-                console.log(`⏳ Pause de ${PAUSE_BETWEEN_SUDOKUS/1000}s avant le prochain sudoku...`);
-                await sleep(PAUSE_BETWEEN_SUDOKUS);
-            }*/
-            
-        } catch (error) {
-            console.error(`❌ Erreur dans la boucle principale: ${error.message}`);
-            stats.errors++;
-            await sleep(5000); // Pause plus longue en cas d'erreur critique
-        }
-    }
-    
-    console.log("🏁 Bot arrêté");
-    console.log(`📊 Statistiques finales: ${stats.totalSolved} sudokus résolus, ${stats.errors} erreurs`);
-}
-
-// Gestion de l'arrêt propre
-process.on('SIGINT', () => {
-    console.log('\n🛑 Arrêt par signal');
-    isProcessing = false;
-    process.exit(0);
+// Routes utilitaires
+app.get("/ping", (req, res) => {
+    res.json({
+        success: true,
+        message: "Worker alive",
+        timestamp: Date.now(),
+        uptime: process.uptime(),
+        initialized: isInitialized
+    });
 });
 
-process.on('SIGTERM', () => {
-    console.log('\n🛑 Arrêt par SIGTERM');
-    isProcessing = false;
-    process.exit(0);
+// Test de performance
+app.get("/perf-test", async (req, res) => {
+    if (!isInitialized) {
+        return res.status(400).json({
+            success: false,
+            error: "Worker non initialisé"
+        });
+    }
+    
+    const testStart = Date.now();
+    
+    // Test de performance sans vraies requêtes
+    const mockTasks = Array.from({length: 10}, (_, i) => ({
+        row: Math.floor(i / 3),
+        col: i % 3,
+        value: (i % 9) + 1
+    }));
+    
+    res.json({
+        success: true,
+        message: "Test de performance",
+        mockTasksGenerated: mockTasks.length,
+        generationTime: Date.now() - testStart,
+        workerReady: true,
+        stats: processingStats
+    });
 });
 
-// Démarrage du serveur
-const PORT = process.env.PORT || 8080;
+// Reset des statistiques
+app.post("/reset-stats", (req, res) => {
+    processingStats = {
+        totalProcessed: 0,
+        totalSuccess: 0,
+        totalErrors: 0,
+        lastProcessingTime: 0
+    };
+    
+    res.json({
+        success: true,
+        message: "Statistiques réinitialisées"
+    });
+});
+
+// Gestion d'erreur globale pour éviter les crashes
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('🚨 Worker Unhandled Rejection:', reason?.message || reason);
+});
+
+process.on('uncaughtException', (error) => {
+    console.error('🚨 Worker Uncaught Exception:', error?.message || error);
+});
+
+const PORT = process.env.PORT || 8081;
 app.listen(PORT, () => {
-    console.log(`🚀 Dynamic Sudoku Bot API running on port ${PORT}`);
-    console.log(`📱 Endpoints disponibles:`);
-    console.log(`   POST /start-bot - Démarre le bot (body: {token: "your_token"})`);
-    console.log(`   POST /submit-token - Fournit le token (body: {token: "your_token"})`);
-    console.log(`   POST /stop-bot - Arrête le bot`);
-    console.log(`   GET /status - Statut du bot`);
-    console.log(`   GET /stats - Statistiques détaillées`);
-    console.log(`\n💡 Usage:`);
-    console.log(`   1. POST /start-bot avec votre token`);
-    console.log(`   2. Le bot résoudra automatiquement les sudokus à l'infini`);
-    console.log(`   3. Pause de ${PAUSE_BETWEEN_SUDOKUS/1000}s entre chaque sudoku`);
+    console.log(`🔧 Worker Sudoku Bot running on port ${PORT}`);
+    console.log(`⚡ Configuration 100% dynamique - aucune variable d'environnement`);
+    console.log(`📡 Prêt à recevoir les tâches du bot principal`);
+    console.log(`\n💡 Le worker doit être initialisé par le bot principal avec:`);
+    console.log(`   POST /initialize`);
+    console.log(`   Body: { "token": "...", "mainBotUrl": "..." }`);
 });
